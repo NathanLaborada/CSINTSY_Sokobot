@@ -15,8 +15,8 @@ import time
 #
 # Hooks for the other members (clearly marked below):
 #   * SokoSearch.heuristic(boxes)   -> estimated pushes remaining
-#   * SokoSearch.is_deadlock(boxes) -> True if the position can never be solved
-# The defaults are only simple placeholders so that the search runs end to end.
+#   * SokoSearch.is_deadlock(boxes, moved) -> True if the position can never be solved
+#     (implemented: static dead squares + freeze deadlocks)
 
 
 class SokoState:
@@ -79,6 +79,36 @@ class SokoSearch:
         self.dirs = tuple((ch, dy * w2 + dx) for ch, dy, dx in self._DIR_DEFS)
         self.offsets = tuple(o for _, o in self.dirs)
         self.dir_char = {o: ch for ch, o in self.dirs}
+        self.dead = self._compute_dead_squares()
+
+        # Search statistics, read by the benchmark harness.
+        self.expanded = 0
+        self.generated = 0
+
+    # Static deadlock precomputation (Member 3)
+    def _compute_dead_squares(self):
+        """Mark every floor cell from which a box can NEVER reach any target.
+
+        Done backwards: start a box on every target and "pull" it in every
+        direction. Pulling a box from c to c-o needs the player at c-o and room
+        for the player to step back to c-2o. Every cell a box can be pulled to
+        is alive; everything else is dead. This catches non-goal corners, dead
+        wall lines (a wall edge with no target along it), and dead pockets,
+        all with one BFS and no special cases."""
+        wall = self.wall
+        alive = bytearray(self.size)
+        stack = list(self.targets)
+        for t in stack:
+            alive[t] = 1
+        while stack:
+            c = stack.pop()
+            for o in self.offsets:
+                box_to = c - o
+                player_to = c - o - o
+                if not alive[box_to] and not wall[box_to] and not wall[player_to]:
+                    alive[box_to] = 1
+                    stack.append(box_to)
+        return bytearray(0 if alive[c] or wall[c] else 1 for c in range(self.size))
 
     # Hooks (to be replaced / improved by the heuristic & deadlock members)
     def heuristic(self, boxes):
@@ -98,8 +128,55 @@ class SokoSearch:
             total += best
         return total
 
-    def is_deadlock(self, boxes):
-        """Placeholder: no deadlock pruning yet."""
+    USE_DEADLOCKS = True  # benchmark --no-deadlock turns this off to measure its effect
+
+    # Dynamic deadlock detection (Member 3)
+    def is_deadlock(self, boxes, moved):
+        """True if pushing a box onto `moved` made the position unsolvable.
+
+        Only the box that just moved can create a new deadlock, so only it is
+        checked: first against the static dead-square table, then for a
+        freeze deadlock (it and its neighbours can no longer move at all)."""
+        if not self.USE_DEADLOCKS:
+            return False
+        if self.dead[moved]:
+            return True
+        frozen = set()
+        if not self._frozen(moved, set(boxes), frozen):
+            return False
+        # A group of frozen boxes is only fatal if one of them is off target.
+        return any(b not in self.targets for b in frozen)
+
+    def _frozen(self, b, boxset, frozen):
+        """Freeze test: can box `b` never be pushed along either axis?
+
+        While a box is being tested it is treated as a wall, so a group of
+        boxes that block each other (e.g. a 2x2 square, or two boxes side by
+        side along a wall) is recognised without infinite recursion. Boxes
+        proven frozen are left in `frozen`; the caller uses that set."""
+        before = set(frozen)
+        frozen.add(b)
+        if self._axis_blocked(b, 1, boxset, frozen) and self._axis_blocked(b, self.w2, boxset, frozen):
+            return True
+        # Not frozen: also forget any box whose "frozen" proof leaned on b being a wall.
+        frozen.intersection_update(before)
+        return False
+
+    def _axis_blocked(self, b, o, boxset, frozen):
+        """Can box `b` not be pushed along the axis given by offset `o`?"""
+        n1, n2 = b - o, b + o
+        wall = self.wall
+        # A wall on either side: the player can't stand behind it or it can't move into it.
+        if wall[n1] or wall[n2] or n1 in frozen or n2 in frozen:
+            return True
+        # Both sides are dead squares: any push along this axis kills it anyway.
+        if self.dead[n1] and self.dead[n2]:
+            return True
+        # A neighbouring box that is itself frozen acts like a wall.
+        if n1 in boxset and self._frozen(n1, boxset, frozen):
+            return True
+        if n2 in boxset and self._frozen(n2, boxset, frozen):
+            return True
         return False
 
     # State helpers
@@ -148,7 +225,7 @@ class SokoSearch:
                 if wall[dest] or dest in boxset:
                     continue
                 new_boxes = tuple(sorted([dest if x == b else x for x in boxes]))
-                if self.is_deadlock(new_boxes):
+                if self.is_deadlock(new_boxes, dest):
                     continue
                 # After the push the player stands where the crate used to be.
                 _, zone = self._flood(b, set(new_boxes))
@@ -184,11 +261,13 @@ class SokoSearch:
                 return self._build_solution(state, parent)
 
             expansions += 1
+            self.expanded = expansions
             if (expansions & 255) == 0 and time.time() > deadline:
                 return ""
 
             g = g_cost[state] + 1
             for nxt, box_cell, off in self._successors(state):
+                self.generated += 1
                 if nxt in closed:
                     continue
                 old = g_cost.get(nxt)
