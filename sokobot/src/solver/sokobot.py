@@ -80,16 +80,16 @@ class SokoSearch:
         self.dirs = tuple((ch, dy * w2 + dx) for ch, dy, dx in self._DIR_DEFS)
         self.offsets = tuple(o for _, o in self.dirs)
         self.dir_char = {o: ch for ch, o in self.dirs}
-        self.dead = self._compute_dead_squares()
 
         # Search statistics, read by the benchmark harness.
         self.expanded = 0
         self.generated = 0
-        
+
         self.INF = 10 ** 9
         self.tlist = sorted(self.targets)
-        self.dist_tables = [self._push_distances(t) for t in self.tlist]    
-        
+        self.dist_tables = [self._push_distances(t) for t in self.tlist]
+        self.dead = self._compute_dead_squares()  # needs dist_tables
+
     def _push_distances(self, target):
         wall, INF = self.wall, self.INF
         d = [INF] * self.size
@@ -111,26 +111,17 @@ class SokoSearch:
     def _compute_dead_squares(self):
         """Mark every floor cell from which a box can NEVER reach any target.
 
-        Done backwards: start a box on every target and "pull" it in every
-        direction. Pulling a box from c to c-o needs the player at c-o and room
-        for the player to step back to c-2o. Every cell a box can be pulled to
-        is alive; everything else is dead. This catches non-goal corners, dead
-        wall lines (a wall edge with no target along it), and dead pockets,
-        all with one BFS and no special cases."""
-        wall = self.wall
-        alive = bytearray(self.size)
-        stack = list(self.targets)
-        for t in stack:
-            alive[t] = 1
-        while stack:
-            c = stack.pop()
-            for o in self.offsets:
-                box_to = c - o
-                player_to = c - o - o
-                if not alive[box_to] and not wall[box_to] and not wall[player_to]:
-                    alive[box_to] = 1
-                    stack.append(box_to)
-        return bytearray(0 if alive[c] or wall[c] else 1 for c in range(self.size))
+        _push_distances already works backwards from each target, "pulling" a
+        box away from it (box to c-o, player to c-2o). A cell that no target's
+        pull ever reaches has distance INF in every table, so a box there can
+        never be pushed onto any goal: it is dead. This catches non-goal
+        corners, dead wall lines (a wall edge with no target along it), and
+        dead pockets, with no special cases and no extra BFS."""
+        wall, INF, tables = self.wall, self.INF, self.dist_tables
+        return bytearray(
+            0 if wall[c] or any(t[c] < INF for t in tables) else 1
+            for c in range(self.size)
+        )
 
     # Hooks (to be replaced / improved by the heuristic & deadlock members)
     def heuristic(self, boxes):
@@ -304,6 +295,10 @@ class SokoSearch:
                 g_cost[nxt] = g
                 parent[nxt] = (state, box_cell, off)
                 h = self.heuristic(nxt.boxes)
+                if h >= self.INF and self.USE_DEADLOCKS:
+                    # Matching deadlock: no way to give every box its own reachable
+                    # target (e.g. two boxes that can only reach the same goal).
+                    continue
                 counter += 1
                 heapq.heappush(open_heap, (g + weight * h, h, counter, nxt))
 
