@@ -1,5 +1,6 @@
 import heapq
 import time
+from collections import deque
 # go to project directory and run: python -m pip install pygame-ce
 
 # Design summary
@@ -84,6 +85,27 @@ class SokoSearch:
         # Search statistics, read by the benchmark harness.
         self.expanded = 0
         self.generated = 0
+        
+        self.INF = 10 ** 9
+        self.tlist = sorted(self.targets)
+        self.dist_tables = [self._push_distances(t) for t in self.tlist]    
+        
+    def _push_distances(self, target):
+        wall, INF = self.wall, self.INF
+        d = [INF] * self.size
+        d[target] = 0
+        q = deque([target])
+        while q:
+            p = q.popleft()
+            for o in self.offsets:
+                b = p - o          # Where the box was before the push
+                s = p - 2 * o      # Where the player stood
+                if wall[b] or wall[s]:
+                    continue
+                if d[b] > d[p] + 1:
+                    d[b] = d[p] + 1
+                    q.append(b)
+        return d
 
     # Static deadlock precomputation (Member 3)
     def _compute_dead_squares(self):
@@ -112,21 +134,27 @@ class SokoSearch:
 
     # Hooks (to be replaced / improved by the heuristic & deadlock members)
     def heuristic(self, boxes):
-        """Placeholder: sum of each box's Manhattan distance to its nearest target."""
-        w2 = self.w2
-        total = 0
-        for b in boxes:
-            if b in self.targets:
-                continue
-            by, bx = divmod(b, w2)
-            best = 10 ** 9
-            for t in self.targets:
-                ty, tx = divmod(t, w2)
-                d = abs(by - ty) + abs(bx - tx)
-                if d < best:
-                    best = d
-            total += best
-        return total
+        INF = self.INF
+        tables = self.dist_tables
+        n = len(self.tlist)
+        best = {0: 0}  # Default to boxes placed yet
+        for b in boxes: # Handling one box at a time
+            nxt = {}
+            for mask, cost in best.items():
+                for j in range(n): # Try every target
+                    if mask >> j & 1: # Skip the targets that are already taken
+                        continue
+                    d = tables[j][b]
+                    if d >= INF: # This box can't reach that target
+                        continue
+                    nm = mask | (1 << j)
+                    v = cost + d
+                    if v < nxt.get(nm, INF): # Keep the chapest way to get this  mask
+                        nxt[nm] = v
+            best = nxt
+            if not best:
+                return INF # some box can never be matched
+        return min(best.values())
 
     USE_DEADLOCKS = True  # benchmark --no-deadlock turns this off to measure its effect
 
