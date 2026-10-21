@@ -3,23 +3,6 @@ import time
 from collections import deque
 # go to project directory and run: python -m pip install pygame-ce
 
-# Design summary
-#   * The grid is flattened into a 1-D array with a 1-cell wall border, so a
-#     neighbour of any cell is simply (cell + offset) and never out of range.
-#   * A search state is (zone_id, sorted tuple of box cells). zone_id is the
-#     smallest cell index the player can reach without pushing anything, so two
-#     positions of the player inside the same region map to the same state.
-#   * Actions are crate PUSHES (macro-moves), not single player steps.
-#   * The search is weighted A* on a heapq priority queue. g(n) = number of
-#     pushes so far, f(n) = g(n) + WEIGHT * h(n).
-#   * Only at the very end are the pushes expanded into 'u','d','l','r' steps.
-#
-# Hooks for the other members (clearly marked below):
-#   * SokoSearch.heuristic(boxes)   -> estimated pushes remaining
-#   * SokoSearch.is_deadlock(boxes, moved) -> True if the position can never be solved
-#     (implemented: static dead squares + freeze deadlocks)
-
-
 class SokoState:
     """Immutable, lightweight, hashable search state.
 
