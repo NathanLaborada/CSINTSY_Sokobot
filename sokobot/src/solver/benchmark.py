@@ -1,14 +1,9 @@
-"""Automated test harness (Nathan).
-
-Run from the sokobot folder:
-    python -m src.solver.benchmark                 # every map in maps/
-    python -m src.solver.benchmark 1 5 original1   # only these maps
-    python -m src.solver.benchmark --no-deadlock   # same, with deadlock pruning off
-
-Prints a Markdown table (paste straight into the report) and writes the same
-rows to benchmark_results.csv. Every returned solution is replayed on the map,
-so a "Solved" row means the moves really put every crate on a goal.
-"""
+# Benchmark for all maps (Nathan)
+# run from the sokobot folder:
+#   python -m src.solver.benchmark
+#   python -m src.solver.benchmark 1 5 original1
+#   python -m src.solver.benchmark --no-deadlock
+# results also saved to benchmark_results.csv
 import csv
 import sys
 import time
@@ -23,8 +18,7 @@ STEP = {"u": (-1, 0), "d": (1, 0), "l": (0, -1), "r": (0, 1)}
 
 
 def replay(static_map, items, moves):
-    """Play `moves` on the map. Returns (all crates on goals?, number of pushes).
-    An illegal move (into a wall, or pushing a crate into a wall/crate) counts as unsolved."""
+    # plays the moves to check the solution actually works, returns (solved, pushes)
     boxes = {(y, x) for y, row in enumerate(items) for x, it in enumerate(row) if it == "$"}
     player = next((y, x) for y, row in enumerate(items) for x, it in enumerate(row) if it == "@")
 

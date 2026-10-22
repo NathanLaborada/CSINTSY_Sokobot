@@ -4,18 +4,13 @@ from collections import deque
 # go to project directory and run: python -m pip install pygame-ce
 
 class SokoState:
-    """Immutable, lightweight, hashable search state.
-
-    zone  : int   - normalized player position (min reachable cell index)
-    boxes : tuple - sorted tuple of box cell indices
-    """
-
+    # zone = smallest cell the player can reach, boxes = sorted tuple of box cells
     __slots__ = ("zone", "boxes", "_hash")
 
     def __init__(self, zone, boxes):
         self.zone = zone
         self.boxes = boxes
-        self._hash = hash((zone, boxes))  # computed once, reused for every lookup
+        self._hash = hash((zone, boxes))
 
     def __hash__(self):
         return self._hash
@@ -32,15 +27,16 @@ class SokoSearch:
     # u, d, l, r as (char, row delta, col delta)
     _DIR_DEFS = (("u", -1, 0), ("d", 1, 0), ("l", 0, -1), ("r", 0, 1))
 
-    WEIGHT = 3.0        # 1.0 = plain A*; larger = greedier and faster, less optimal
-    TIME_LIMIT = 13.0   # seconds; the program's hard limit is 15
+    WEIGHT = 1.5        # 1.0 = normal A*, tested 1.0 to 8.0 and 1.5 was best
+    TIME_LIMIT = 13.0   # seconds, gui limit is 15
 
     def __init__(self, width, height, mapData, itemsData):
+        self.deadline = time.time() + self.TIME_LIMIT
         self.w2 = width + 2
         self.size = self.w2 * (height + 2)
         w2 = self.w2
 
-        self.wall = bytearray(b"\x01") * self.size  # border (and outside) = wall
+        self.wall = bytearray(b"\x01") * self.size  # border counts as wall
         self.targets = set()
         boxes = []
         player = -1
@@ -64,14 +60,20 @@ class SokoSearch:
         self.offsets = tuple(o for _, o in self.dirs)
         self.dir_char = {o: ch for ch, o in self.dirs}
 
-        # Search statistics, read by the benchmark harness.
+        # for benchmark.py
         self.expanded = 0
         self.generated = 0
 
         self.INF = 10 ** 9
         self.tlist = sorted(self.targets)
         self.dist_tables = [self._push_distances(t) for t in self.tlist]
-        self.dead = self._compute_dead_squares()  # needs dist_tables
+        self.dead = self._compute_dead_squares()
+        self.h_cache = {}
+        # reach[cell] = list of (target bit, distance) for targets a box on that cell can reach
+        self.reach = [
+            [(1 << j, t[c]) for j, t in enumerate(self.dist_tables) if t[c] < self.INF]
+            for c in range(self.size)
+        ]
 
     def _push_distances(self, target):
         wall, INF = self.wall, self.INF
@@ -90,55 +92,46 @@ class SokoSearch:
                     q.append(b)
         return d
 
-    # Static deadlock precomputation (Member 3)
+    # dead square = box there can't reach any target (INF in every table)
     def _compute_dead_squares(self):
-        """Mark every floor cell from which a box can NEVER reach any target.
-
-        _push_distances already works backwards from each target, "pulling" a
-        box away from it (box to c-o, player to c-2o). A cell that no target's
-        pull ever reaches has distance INF in every table, so a box there can
-        never be pushed onto any goal: it is dead. This catches non-goal
-        corners, dead wall lines (a wall edge with no target along it), and
-        dead pockets, with no special cases and no extra BFS."""
         wall, INF, tables = self.wall, self.INF, self.dist_tables
         return bytearray(
             0 if wall[c] or any(t[c] < INF for t in tables) else 1
             for c in range(self.size)
         )
 
-    # Hooks (to be replaced / improved by the heuristic & deadlock members)
     def heuristic(self, boxes):
+        # same boxes = same h, so save it
+        h = self.h_cache.get(boxes)
+        if h is None:
+            h = self.h_cache[boxes] = self._matching_cost(boxes)
+        return h
+
+    def _matching_cost(self, boxes):
         INF = self.INF
-        tables = self.dist_tables
-        n = len(self.tlist)
-        best = {0: 0}  # Default to boxes placed yet
-        for b in boxes: # Handling one box at a time
+        reach = self.reach
+        best = {0: 0}  # mask of used targets -> lowest cost
+        # boxes with fewer reachable targets go first (faster, same answer)
+        for b in sorted(boxes, key=lambda b: len(reach[b])):
             nxt = {}
+            get = nxt.get
             for mask, cost in best.items():
-                for j in range(n): # Try every target
-                    if mask >> j & 1: # Skip the targets that are already taken
+                for bit, d in reach[b]:
+                    if mask & bit:  # target already used
                         continue
-                    d = tables[j][b]
-                    if d >= INF: # This box can't reach that target
-                        continue
-                    nm = mask | (1 << j)
+                    nm = mask | bit
                     v = cost + d
-                    if v < nxt.get(nm, INF): # Keep the chapest way to get this  mask
+                    if v < get(nm, INF):
                         nxt[nm] = v
             best = nxt
             if not best:
-                return INF # some box can never be matched
+                return INF  # some box can't get its own target
         return min(best.values())
 
-    USE_DEADLOCKS = True  # benchmark --no-deadlock turns this off to measure its effect
+    USE_DEADLOCKS = True  # set to False by benchmark --no-deadlock
 
-    # Dynamic deadlock detection (Member 3)
     def is_deadlock(self, boxes, moved):
-        """True if pushing a box onto `moved` made the position unsolvable.
-
-        Only the box that just moved can create a new deadlock, so only it is
-        checked: first against the static dead-square table, then for a
-        freeze deadlock (it and its neighbours can no longer move at all)."""
+        # only the box that just moved can cause a new deadlock
         if not self.USE_DEADLOCKS:
             return False
         if self.dead[moved]:
@@ -146,46 +139,34 @@ class SokoSearch:
         frozen = set()
         if not self._frozen(moved, set(boxes), frozen):
             return False
-        # A group of frozen boxes is only fatal if one of them is off target.
+        # frozen boxes are fine if they're all on targets
         return any(b not in self.targets for b in frozen)
 
     def _frozen(self, b, boxset, frozen):
-        """Freeze test: can box `b` never be pushed along either axis?
-
-        While a box is being tested it is treated as a wall, so a group of
-        boxes that block each other (e.g. a 2x2 square, or two boxes side by
-        side along a wall) is recognised without infinite recursion. Boxes
-        proven frozen are left in `frozen`; the caller uses that set."""
+        # box is frozen if it can't move horizontally or vertically.
+        # b is treated as a wall while checking its neighbours so it doesn't loop forever
         before = set(frozen)
         frozen.add(b)
         if self._axis_blocked(b, 1, boxset, frozen) and self._axis_blocked(b, self.w2, boxset, frozen):
             return True
-        # Not frozen: also forget any box whose "frozen" proof leaned on b being a wall.
-        frozen.intersection_update(before)
+        frozen.intersection_update(before)  # undo, b isn't frozen
         return False
 
     def _axis_blocked(self, b, o, boxset, frozen):
-        """Can box `b` not be pushed along the axis given by offset `o`?"""
         n1, n2 = b - o, b + o
         wall = self.wall
-        # A wall on either side: the player can't stand behind it or it can't move into it.
         if wall[n1] or wall[n2] or n1 in frozen or n2 in frozen:
             return True
-        # Both sides are dead squares: any push along this axis kills it anyway.
         if self.dead[n1] and self.dead[n2]:
             return True
-        # A neighbouring box that is itself frozen acts like a wall.
         if n1 in boxset and self._frozen(n1, boxset, frozen):
             return True
         if n2 in boxset and self._frozen(n2, boxset, frozen):
             return True
         return False
 
-    # State helpers
     def _flood(self, start, boxset):
-        """Flood fill from `start` with boxes as obstacles.
-
-        Returns (seen bytearray, min reachable cell index)."""
+        # returns (cells the player can reach, smallest reachable cell)
         wall = self.wall
         offsets = self.offsets
         seen = bytearray(self.size)
@@ -210,9 +191,8 @@ class SokoSearch:
                 return False
         return True
 
-    # Push-based action generation
     def _successors(self, state):
-        """Yield (new_state, box_from_cell, direction_offset) for every legal push."""
+        # every possible push from this state
         wall = self.wall
         boxes = state.boxes
         boxset = set(boxes)
@@ -220,20 +200,20 @@ class SokoSearch:
 
         for b in boxes:
             for o in self.offsets:
-                stand = b - o              # cell the player must stand on to push
+                stand = b - o              # player stands here to push
                 if not seen[stand]:
                     continue
-                dest = b + o               # cell the crate moves into
+                dest = b + o               # box moves here
                 if wall[dest] or dest in boxset:
                     continue
                 new_boxes = tuple(sorted([dest if x == b else x for x in boxes]))
                 if self.is_deadlock(new_boxes, dest):
                     continue
-                # After the push the player stands where the crate used to be.
+                # player ends up where the box was
                 _, zone = self._flood(b, set(new_boxes))
                 yield SokoState(zone, new_boxes), b, o
 
-    # Search framework: weighted A* on heapq
+    # weighted A*
     def solve(self):
         start_boxes = tuple(sorted(self.start_boxes))
         if self._is_goal(start_boxes):
@@ -243,10 +223,10 @@ class SokoSearch:
         start = SokoState(zone0, start_boxes)
 
         weight = self.WEIGHT
-        deadline = time.time() + self.TIME_LIMIT
+        deadline = self.deadline
 
         g_cost = {start: 0}
-        parent = {start: None}   # state -> (prev_state, box_cell_before_push, direction_offset)
+        parent = {start: None}   # state -> (prev state, box cell, direction)
         counter = 0
         h0 = self.heuristic(start_boxes)
         open_heap = [(weight * h0, h0, counter, start)]
@@ -264,7 +244,7 @@ class SokoSearch:
 
             expansions += 1
             self.expanded = expansions
-            if (expansions & 255) == 0 and time.time() > deadline:
+            if (expansions & 15) == 0 and time.time() > deadline:
                 return ""
 
             g = g_cost[state] + 1
@@ -279,15 +259,13 @@ class SokoSearch:
                 parent[nxt] = (state, box_cell, off)
                 h = self.heuristic(nxt.boxes)
                 if h >= self.INF and self.USE_DEADLOCKS:
-                    # Matching deadlock: no way to give every box its own reachable
-                    # target (e.g. two boxes that can only reach the same goal).
-                    continue
+                    continue  # boxes can't all get different targets
                 counter += 1
                 heapq.heappush(open_heap, (g + weight * h, h, counter, nxt))
 
-        return ""  # if no solution is found
+        return ""  # no solution found
 
-    # Path reconstruction: pushes -> exact walking steps
+    # turn the list of pushes into u/d/l/r moves
     def _build_solution(self, goal_state, parent):
         pushes = []
         s = goal_state
@@ -303,14 +281,14 @@ class SokoSearch:
         for box_cell, off in pushes:
             stand = box_cell - off
             out.append(self._walk(player, stand, boxset))
-            out.append(self.dir_char[off])       # the push itself moves the player 1 step
+            out.append(self.dir_char[off])
             boxset.discard(box_cell)
             boxset.add(box_cell + off)
             player = box_cell
         return "".join(out)
 
     def _walk(self, src, dst, boxset):
-        """Shortest walking path (BFS, boxes are obstacles) from src to dst."""
+        # BFS walking path from src to dst, boxes block the way
         if src == dst:
             return ""
         wall = self.wall
@@ -334,7 +312,7 @@ class SokoSearch:
                         return "".join(steps)
                     nxt_frontier.append(q)
             frontier = nxt_frontier
-        return ""  # should never happen for a state the search generated
+        return ""
 
 
 class SokoBot:
